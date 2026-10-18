@@ -8,29 +8,34 @@ from fastapi.responses import StreamingResponse
 
 app = FastAPI()
 
-# Działający strumień Antyradia
-STREAM_URL = "https://an.cdn.eurozet.pl/ant-web.mp3"
+# Lista strumieni (główny + zapasowe węzły CDN Eurozetu)
+STREAM_URLS = [
+    "https://an.cdn.eurozet.pl/ant-web.mp3",
+    "https://an01.cdn.eurozet.pl/ant-web.mp3",
+    "https://an02.cdn.eurozet.pl/ant-web.mp3",
+    "https://n-22-12.dcs.redcdn.pl/sc/o2/Eurozet/live/antyradio.livx?audio=5",
+]
 
+# Czyste nagłówki przeglądarki (bez Icy-MetaData, który wywoływał błąd 404 na CDN!)
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept": "*/*",
-    "Icy-MetaData": "0",
+    "Referer": "https://player.antyradio.pl/",
 }
 
 META_INTERVAL = 16000
 current_song = "Antyradio"
 current_cover = ""
 
-# Zmienne diagnostyczne dla /debug
 last_error = "Brak błędów"
 total_bytes_sent = 0
-last_client_headers = {}
+active_stream_url = STREAM_URLS[0]
 
 
 async def fetch_rds_data(client: httpx.AsyncClient):
     global current_song, current_cover
 
-    # 1. Próba pobrania tytułu i okładki z czytnika Eurozetu
+    # 1. Czytnik RDS Eurozetu (Tytuł + Okładka)
     try:
         resp = await client.get("https://rds.eurozet.pl/reader/var/antyradio.json", headers=HEADERS)
         if resp.status_code == 200:
@@ -49,7 +54,7 @@ async def fetch_rds_data(client: httpx.AsyncClient):
     except Exception:
         pass
 
-    # 2. Fallback: OnlineRadioBox (tytuł)
+    # 2. Fallback: OnlineRadioBox
     try:
         resp = await client.get(
             "https://onlineradiobox.com/pl/antyradio94/playlist/",
@@ -66,8 +71,24 @@ async def fetch_rds_data(client: httpx.AsyncClient):
         pass
 
 
+async def find_working_stream(client: httpx.AsyncClient) -> str:
+    """Znajduje pierwszy strumień zwracający HTTP 200 i audio/mpeg."""
+    global active_stream_url
+    for url in STREAM_URLS:
+        try:
+            async with client.stream("GET", url, headers=HEADERS) as r:
+                ct = r.headers.get("content-type", "").lower()
+                if r.status_code == 200 and ("audio" in ct or "mpeg" in ct or "aac" in ct or "octet" in ct):
+                    active_stream_url = url
+                    return url
+        except Exception:
+            continue
+    return STREAM_URLS[0]
+
+
 async def update_metadata_loop():
     async with httpx.AsyncClient(timeout=10.0, follow_redirects=True, verify=False) as client:
+        await find_working_stream(client)
         while True:
             await fetch_rds_data(client)
             await asyncio.sleep(15)
@@ -92,38 +113,35 @@ def build_icy_metadata(title: str, cover_url: str = "") -> bytes:
 
 @app.get("/")
 def health_check():
-    return {"status": "online", "now_playing": current_song}
+    return {"status": "online", "now_playing": current_song, "cover": current_cover}
 
 
 @app.get("/debug")
 async def debug_info():
-    """Endpoint diagnostyczny pokazujący status strumienia i ewentualne błędy."""
-    stream_test = "Nieznany"
-    first_chunk_size = 0
-    try:
-        async with httpx.AsyncClient(timeout=5.0, follow_redirects=True, verify=False) as client:
-            async with client.stream("GET", STREAM_URL, headers=HEADERS) as r:
-                stream_test = f"HTTP {r.status_code} ({r.headers.get('content-type')})"
-                async for chunk in r.aiter_bytes(chunk_size=1024):
-                    first_chunk_size = len(chunk)
-                    break
-    except Exception as e:
-        stream_test = f"Błąd: {repr(e)}"
+    results = {}
+    async with httpx.AsyncClient(timeout=5.0, follow_redirects=True, verify=False) as client:
+        for url in STREAM_URLS:
+            try:
+                async with client.stream("GET", url, headers=HEADERS) as r:
+                    results[url] = {
+                        "status": r.status_code,
+                        "content_type": r.headers.get("content-type"),
+                    }
+            except Exception as e:
+                results[url] = {"error": repr(e)}
 
     return {
         "now_playing": current_song,
         "cover_url": current_cover,
-        "eurozet_stream_test": stream_test,
-        "first_chunk_received_bytes": first_chunk_size,
+        "selected_stream": active_stream_url,
         "total_bytes_sent_to_players": total_bytes_sent,
         "last_stream_error": last_error,
-        "last_player_headers": last_client_headers,
+        "streams_check": results,
     }
 
 
 @app.head("/antyradio.mp3")
 async def head_audio(request: Request):
-    """Odpowiedź na zapytanie testowe HEAD z Replaio / VLC."""
     icy_requested = request.headers.get("icy-metadata", "0").strip() == "1"
     headers = {
         "Content-Type": "audio/mpeg",
@@ -140,17 +158,17 @@ async def head_audio(request: Request):
 
 @app.get("/antyradio.mp3")
 async def stream_audio(request: Request):
-    global last_error, total_bytes_sent, last_client_headers
-    last_client_headers = dict(request.headers)
+    global last_error, total_bytes_sent
     icy_requested = request.headers.get("icy-metadata", "0").strip() == "1"
 
     async def audio_generator():
         global last_error, total_bytes_sent
         buffer = bytearray()
         timeout = httpx.Timeout(connect=10.0, read=60.0, write=10.0, pool=10.0)
-        client = httpx.AsyncClient(timeout=timeout, follow_redirects=True, verify=False, http2=False)
+        client = httpx.AsyncClient(timeout=timeout, follow_redirects=True, verify=False)
         try:
-            req = client.build_request("GET", STREAM_URL, headers=HEADERS)
+            target_url = await find_working_stream(client)
+            req = client.build_request("GET", target_url, headers=HEADERS)
             resp = await client.send(req, stream=True)
             try:
                 async for chunk in resp.aiter_bytes(chunk_size=4096):
