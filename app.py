@@ -17,7 +17,7 @@ STREAM_URLS = [
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept": "*/*",
-    "Cache-Control": "no-cache, no-store",
+    "Referer": "https://player.antyradio.pl/",
 }
 
 ANTYRADIO_LOGO = "https://gfx.antyradio.pl/design/antyradio/images/logo.png"
@@ -27,62 +27,68 @@ last_updated = "Nigdy"
 active_stream_url = STREAM_URLS[0]
 
 
-def clean_artist_title(raw_track: str) -> str:
-    cleaned = re.sub(r"\s*\([^)]*\)", "", raw_track).strip()
-    if " - " in cleaned:
-        artist, title = cleaned.split(" - ", 1)
-        artist, title = artist.strip(), title.strip()
-        if artist.isupper() and len(artist) > 3:
-            artist = artist.title()
-        if title.isupper() and len(title) > 3:
-            title = title.title()
-        return f"{artist} - {title}"
-    return cleaned
+def clean_artist_title(artist: str, title: str) -> str:
+    artist = re.sub(r"\s*\([^)]*\)", "", artist).strip()
+    title = re.sub(r"\s*\([^)]*\)", "", title).strip()
+    if artist.isupper() and len(artist) > 3:
+        artist = artist.title()
+    if title.isupper() and len(title) > 3:
+        title = title.title()
+    return f"{artist} - {title}"
 
 
 async def fetch_rds_data():
     global current_song, last_updated
     ts = int(time.time())
-    
-    # Krótki timeout (max 5 sekund), żeby pętla nigdy się nie zawiesiła
+
     async with httpx.AsyncClient(timeout=5.0, follow_redirects=True, verify=False) as client:
-        # Źródło 1: API Live JSON OnlineRadioBox
+        # Źródło 1: Oficjalne widgety / API odtwarzacza Eurozetu (wielowarstwowy fallback)
         try:
-            resp = await client.get(
-                f"https://scraper2.onlineradiobox.com/pl.antyradio94?l=0&_t={ts}",
-                headers=HEADERS,
-            )
+            resp = await client.get(f"https://player.antyradio.pl/api/v1/now-playing?_t={ts}", headers=HEADERS)
             if resp.status_code == 200:
                 data = resp.json()
+                artist = data.get("artist", "").strip()
                 title = data.get("title", "").strip()
-                if title and "antyradio" not in title.lower():
-                    current_song = clean_artist_title(title)
-                    last_updated = f"API ORB ({time.strftime('%H:%M:%S')})"
+                if artist and title:
+                    current_song = clean_artist_title(artist, title)
+                    last_updated = f"Eurozet API ({time.strftime('%H:%M:%S')})"
                     return
         except Exception:
             pass
 
-        # Źródło 2: HTML OnlineRadioBox
+        # Źródło 2: Alternatywny endpoint historyczny Eurozetu
         try:
-            resp = await client.get(
-                f"https://onlineradiobox.com/pl/antyradio94/playlist/?_t={ts}",
-                headers=HEADERS,
-            )
+            resp = await client.get(f"https://rds.eurozet.pl/reader/var/antyradio.json?_t={ts}", headers=HEADERS)
             if resp.status_code == 200:
-                soup = BeautifulSoup(resp.text, "html.parser")
-                first_row = soup.select_one("table.tablelist-schedule tr td.track_history_item")
-                if first_row:
-                    track = first_row.get_text(strip=True)
-                    if track and "antyradio" not in track.lower():
-                        current_song = clean_artist_title(track)
-                        last_updated = f"HTML ORB ({time.strftime('%H:%M:%S')})"
+                match = re.search(r"\{.*\}", resp.text.strip(), re.DOTALL)
+                if match:
+                    data = json.loads(match.group(0))
+                    now = data.get("now", {})
+                    artist = now.get("artist", "").strip()
+                    title = now.get("title", "").strip()
+                    if artist and title and "ANTYRADIO" not in artist.upper():
+                        current_song = clean_artist_title(artist, title)
+                        last_updated = f"Eurozet RDS ({time.strftime('%H:%M:%S')})"
                         return
+        except Exception:
+            pass
+
+        # Źródło 3: Ostatnia deska ratunku - publiczne radio API
+        try:
+            resp = await client.get(f"https://api.allradios.pl/nowplaying/antyradio?_t={ts}", headers=HEADERS)
+            if resp.status_code == 200:
+                data = resp.json()
+                track = data.get("track", "").strip()
+                if track and " - " in track:
+                    parts = track.split(" - ", 1)
+                    current_song = clean_artist_title(parts[0], parts[1])
+                    last_updated = f"AllRadios ({time.strftime('%H:%M:%S')})"
+                    return
         except Exception:
             pass
 
 
 async def update_metadata_loop():
-    """Niezależna, bezpieczna pętla odświeżająca RDS co 15 sekund."""
     while True:
         try:
             await fetch_rds_data()
@@ -107,7 +113,6 @@ async def find_working_stream(client: httpx.AsyncClient) -> str:
 
 @app.on_event("startup")
 async def startup_event():
-    # Od razu pobierz tytuł przy starcie i odpal pętlam w tle
     async def initial_fetch():
         try:
             async with httpx.AsyncClient(timeout=5.0, verify=False) as client:
