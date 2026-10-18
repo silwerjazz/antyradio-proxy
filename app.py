@@ -8,26 +8,20 @@ from fastapi.responses import StreamingResponse
 
 app = FastAPI()
 
-# Lista strumieni Antyradia (główny + zapasowe serwery bez blokad geo/IP)
-STREAM_URLS = [
-    "https://an.cdn.eurozet.pl/ant-waw.mp3",
-    "https://an.cdn.eurozet.pl/ant-web.mp3",
-    "http://n-22-12.dcs.redcdn.pl/sc/o2/Eurozet/live/antyradio.livx?audio=5",
-    "http://ant-waw-01.cdn.eurozet.pl:8602/"
-]
+# Potwierdzony, działający strumień Antyradia (status 200 audio/mpeg)
+STREAM_URL = "https://an.cdn.eurozet.pl/ant-web.mp3"
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept": "*/*",
-    "Connection": "keep-alive"
 }
 
 META_INTERVAL = 16000
-current_song = "Antyradio Warszawa"
+current_song = "Antyradio"
 
 
 async def fetch_rds_title(client: httpx.AsyncClient) -> str:
-    # Źródło 1: OnlineRadioBox (najpewniejsze z zagranicznych IP)
+    # Źródło 1: OnlineRadioBox
     try:
         resp = await client.get(
             "https://onlineradiobox.com/pl/antyradio94/playlist/",
@@ -77,7 +71,8 @@ async def startup_event():
 
 
 def build_icy_metadata(title: str) -> bytes:
-    clean_title = title[:120].replace("'", "")
+    # Bezpieczne kodowanie znaków dla odtwarzaczy Android Auto / Replaio
+    clean_title = title[:100].replace("'", "").replace(";", "")
     meta_str = f"StreamTitle='{clean_title}';"
     meta_bytes = meta_str.encode("utf-8", errors="replace")
     length_blocks = (len(meta_bytes) + 15) // 16
@@ -90,55 +85,44 @@ def health_check():
     return {"status": "online", "now_playing": current_song}
 
 
-@app.get("/debug")
-async def debug_streams():
-    """Sprawdza, który serwer Antyradia wpuszcza połączenie z Rendera."""
-    results = {}
-    async with httpx.AsyncClient(timeout=5.0, follow_redirects=True, verify=False) as client:
-        for url in STREAM_URLS:
-            try:
-                async with client.stream("GET", url, headers=HEADERS) as r:
-                    results[url] = {"status": r.status_code, "content_type": r.headers.get("content-type")}
-            except Exception as e:
-                results[url] = {"error": str(e)}
-    return {"now_playing": current_song, "streams_check": results}
-
-
 @app.get("/antyradio.mp3")
+@app.head("/antyradio.mp3")
 async def stream_audio(request: Request):
-    icy_requested = request.headers.get("Icy-MetaData") == "1"
+    # FastAPI przechowuje nagłówki małymi literami
+    icy_header = request.headers.get("icy-metadata", "0").strip()
+    icy_requested = (icy_header == "1")
 
     async def audio_generator():
         buffer = bytearray()
-        async with httpx.AsyncClient(timeout=None, follow_redirects=True, verify=False) as client:
-            for stream_url in STREAM_URLS:
-                try:
-                    async with client.stream("GET", stream_url, headers=HEADERS) as resp:
-                        if resp.status_code != 200:
+        timeout = httpx.Timeout(connect=10.0, read=30.0, write=10.0, pool=10.0)
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, verify=False) as client:
+            try:
+                async with client.stream("GET", STREAM_URL, headers=HEADERS) as resp:
+                    async for chunk in resp.aiter_bytes(chunk_size=4096):
+                        if not chunk:
                             continue
-                        async for chunk in resp.aiter_bytes(chunk_size=4096):
-                            if not chunk:
-                                continue
-                            if not icy_requested:
-                                yield chunk
-                            else:
-                                buffer.extend(chunk)
-                                while len(buffer) >= META_INTERVAL:
-                                    yield bytes(buffer[:META_INTERVAL])
-                                    del buffer[:META_INTERVAL]
-                                    yield build_icy_metadata(current_song)
-                        break
-                except Exception:
-                    continue
+                        if not icy_requested:
+                            yield chunk
+                        else:
+                            buffer.extend(chunk)
+                            while len(buffer) >= META_INTERVAL:
+                                yield bytes(buffer[:META_INTERVAL])
+                                del buffer[:META_INTERVAL]
+                                yield build_icy_metadata(current_song)
+            except Exception:
+                pass
 
     headers = {
         "Content-Type": "audio/mpeg",
-        "icy-name": "Antyradio Warszawa (RDS)",
+        "icy-name": "Antyradio (RDS)",
         "icy-genre": "Rock",
-        "Cache-Control": "no-cache, no-store",
-        "Connection": "keep-alive",
+        "icy-br": "128",
+        "Cache-Control": "no-cache, no-store, must-revalidate",
+        "Pragma": "no-cache",
+        "Expires": "0",
+        "X-Accel-Buffering": "no",  # Wyłącza buforowanie proxy na Renderze!
     }
     if icy_requested:
         headers["icy-metaint"] = str(META_INTERVAL)
 
-    return StreamingResponse(audio_generator(), headers=headers)
+    return StreamingResponse(audio_generator(), media_type="audio/mpeg", headers=headers)
