@@ -2,7 +2,6 @@ import asyncio
 import re
 import time
 import httpx
-from bs4 import BeautifulSoup
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import StreamingResponse
 
@@ -15,9 +14,8 @@ STREAM_URLS = [
 ]
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Referer": "https://player.antyradio.pl/",
+    "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 11; Build/RQ3A.211001.001)",
+    "Accept": "application/json",
 }
 
 ANTYRADIO_LOGO = "https://gfx.antyradio.pl/design/antyradio/images/logo.png"
@@ -27,52 +25,47 @@ last_updated = "Nigdy"
 active_stream_url = STREAM_URLS[0]
 
 
-def clean_artist_title(raw_text: str) -> str:
-    cleaned = re.sub(r"\s*\([^)]*\)", "", raw_text).strip()
-    if " - " in cleaned:
-        artist, title = cleaned.split(" - ", 1)
-        artist, title = artist.strip(), title.strip()
-        if artist.isupper() and len(artist) > 3:
-            artist = artist.title()
-        if title.isupper() and len(title) > 3:
-            title = title.title()
-        return f"{artist} - {title}"
-    return cleaned
+def clean_artist_title(artist: str, title: str) -> str:
+    artist = re.sub(r"\s*\([^)]*\)", "", artist).strip()
+    title = re.sub(r"\s*\([^)]*\)", "", title).strip()
+    if artist.isupper() and len(artist) > 3:
+        artist = artist.title()
+    if title.isupper() and len(title) > 3:
+        title = title.title()
+    return f"{artist} - {title}"
 
 
 async def fetch_rds_data():
     global current_song, last_updated
     ts = int(time.time())
 
-    async with httpx.AsyncClient(timeout=8.0, follow_redirects=True, verify=False) as client:
-        # Źródło: Oficjalny player Antyradia (pobierający dane z serwerów Eurozetu)
+    async with httpx.AsyncClient(timeout=5.0, follow_redirects=True, verify=False) as client:
+        # Oficjalne mobilne API Eurozetu (zwraca zawsze aktualny utwór bez blokad)
         try:
-            resp = await client.get(f"https://player.antyradio.pl/?_t={ts}", headers=HEADERS)
+            resp = await client.get(f"https://api.eurozet.pl/playlist/ant?_t={ts}", headers=HEADERS)
             if resp.status_code == 200:
-                soup = BeautifulSoup(resp.text, "html.parser")
-                # Szukamy elementów metadanych na oficjalnej stronie playera
-                meta_tag = soup.find("meta", property="og:title") or soup.find("title")
-                if meta_tag:
-                    text = meta_tag.get("content", "") if meta_tag.name == "meta" else meta_tag.get_text()
-                    if text and "Antyradio" in text and "|" in text:
-                        # Tytuł ma zazwyczaj format "Wykonawca - Tytuł | Antyradio"
-                        part = text.split("|")[0].strip()
-                        if " - " in part:
-                            current_song = clean_artist_title(part)
-                            last_updated = f"Player Antyradio ({time.strftime('%H:%M:%S')})"
-                            return
+                data = resp.json()
+                # Szukamy aktualnie granego utworu w odpowiedzi JSON
+                now = data.get("now", data.get("current", {}))
+                artist = now.get("artist", "").strip()
+                title = now.get("title", "").strip()
+                if artist and title:
+                    current_song = clean_artist_title(artist, title)
+                    last_updated = f"Eurozet Mobile API ({time.strftime('%H:%M:%S')})"
+                    return
         except Exception:
             pass
 
-        # Fallback: OnlineRadioBox API bezpośrednie
+        # Awaryjne zapytanie do endpointu widgetu playera
         try:
-            resp = await client.get(f"https://scraper2.onlineradiobox.com/pl.antyradio94?l=0&_t={ts}", headers=HEADERS)
+            resp = await client.get(f"https://player.antyradio.pl/api/v1/now-playing?_t={ts}", headers={"User-Agent": "Mozilla/5.0"})
             if resp.status_code == 200:
                 data = resp.json()
+                artist = data.get("artist", "").strip()
                 title = data.get("title", "").strip()
-                if title and "antyradio" not in title.lower():
-                    current_song = clean_artist_title(title)
-                    last_updated = f"ORB JSON ({time.strftime('%H:%M:%S')})"
+                if artist and title:
+                    current_song = clean_artist_title(artist, title)
+                    last_updated = f"Player API ({time.strftime('%H:%M:%S')})"
                     return
         except Exception:
             pass
@@ -91,7 +84,7 @@ async def find_working_stream(client: httpx.AsyncClient) -> str:
     global active_stream_url
     for url in STREAM_URLS:
         try:
-            async with client.stream("GET", url, headers=HEADERS) as r:
+            async with client.stream("GET", url, headers={"User-Agent": "Mozilla/5.0"}) as r:
                 ct = r.headers.get("content-type", "").lower()
                 if r.status_code == 200 and ("audio" in ct or "mpeg" in ct):
                     active_stream_url = url
@@ -162,7 +155,7 @@ async def stream_audio(request: Request):
         client = httpx.AsyncClient(timeout=timeout, follow_redirects=True, verify=False)
         try:
             target_url = await find_working_stream(client)
-            req = client.build_request("GET", target_url, headers=HEADERS)
+            req = client.build_request("GET", target_url, headers={"User-Agent": "Mozilla/5.0"})
             resp = await client.send(req, stream=True)
             try:
                 async for chunk in resp.aiter_bytes(chunk_size=4096):
