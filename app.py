@@ -14,25 +14,28 @@ STREAM_URLS = [
 ]
 
 HEADERS = {
-    "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 11; Build/RQ3A.211001.001)",
-    "Accept": "application/json",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "*/*",
 }
 
 ANTYRADIO_LOGO = "https://gfx.antyradio.pl/design/antyradio/images/logo.png"
 META_INTERVAL = 16000
-current_song = "Antyradio"
+current_song = "Antyradio Warszawa"
 last_updated = "Nigdy"
 active_stream_url = STREAM_URLS[0]
 
 
-def clean_artist_title(artist: str, title: str) -> str:
-    artist = re.sub(r"\s*\([^)]*\)", "", artist).strip()
-    title = re.sub(r"\s*\([^)]*\)", "", title).strip()
-    if artist.isupper() and len(artist) > 3:
-        artist = artist.title()
-    if title.isupper() and len(title) > 3:
-        title = title.title()
-    return f"{artist} - {title}"
+def clean_artist_title(raw_text: str) -> str:
+    cleaned = re.sub(r"\s*\([^)]*\)", "", raw_text).strip()
+    if " - " in cleaned:
+        artist, title = cleaned.split(" - ", 1)
+        artist, title = artist.strip(), title.strip()
+        if artist.isupper() and len(artist) > 3:
+            artist = artist.title()
+        if title.isupper() and len(title) > 3:
+            title = title.title()
+        return f"{artist} - {title}"
+    return cleaned
 
 
 async def fetch_rds_data():
@@ -40,32 +43,28 @@ async def fetch_rds_data():
     ts = int(time.time())
 
     async with httpx.AsyncClient(timeout=5.0, follow_redirects=True, verify=False) as client:
-        # Oficjalne mobilne API Eurozetu (zwraca zawsze aktualny utwór bez blokad)
+        # Oficjalne otwarte API OnlineRadioBox dla Antyradia
         try:
-            resp = await client.get(f"https://api.eurozet.pl/playlist/ant?_t={ts}", headers=HEADERS)
+            resp = await client.get(f"https://scraper2.onlineradiobox.com/pl.antyradio94?l=0&_t={ts}", headers=HEADERS)
             if resp.status_code == 200:
                 data = resp.json()
-                # Szukamy aktualnie granego utworu w odpowiedzi JSON
-                now = data.get("now", data.get("current", {}))
-                artist = now.get("artist", "").strip()
-                title = now.get("title", "").strip()
-                if artist and title:
-                    current_song = clean_artist_title(artist, title)
-                    last_updated = f"Eurozet Mobile API ({time.strftime('%H:%M:%S')})"
+                title = data.get("title", "").strip()
+                if title and "antyradio" not in title.lower():
+                    current_song = clean_artist_title(title)
+                    last_updated = f"ORB API ({time.strftime('%H:%M:%S')})"
                     return
         except Exception:
             pass
 
-        # Awaryjne zapytanie do endpointu widgetu playera
+        # Zapasowe publiczne API radio
         try:
-            resp = await client.get(f"https://player.antyradio.pl/api/v1/now-playing?_t={ts}", headers={"User-Agent": "Mozilla/5.0"})
+            resp = await client.get(f"https://api.allradios.pl/nowplaying/antyradio?_t={ts}", headers=HEADERS)
             if resp.status_code == 200:
                 data = resp.json()
-                artist = data.get("artist", "").strip()
-                title = data.get("title", "").strip()
-                if artist and title:
-                    current_song = clean_artist_title(artist, title)
-                    last_updated = f"Player API ({time.strftime('%H:%M:%S')})"
+                track = data.get("track", "").strip()
+                if track and " - " in track:
+                    current_song = clean_artist_title(track.split(" - ", 1)[0], track.split(" - ", 1)[1])
+                    last_updated = f"AllRadios ({time.strftime('%H:%M:%S')})"
                     return
         except Exception:
             pass
@@ -84,7 +83,7 @@ async def find_working_stream(client: httpx.AsyncClient) -> str:
     global active_stream_url
     for url in STREAM_URLS:
         try:
-            async with client.stream("GET", url, headers={"User-Agent": "Mozilla/5.0"}) as r:
+            async with client.stream("GET", url, headers=HEADERS) as r:
                 ct = r.headers.get("content-type", "").lower()
                 if r.status_code == 200 and ("audio" in ct or "mpeg" in ct):
                     active_stream_url = url
@@ -155,7 +154,7 @@ async def stream_audio(request: Request):
         client = httpx.AsyncClient(timeout=timeout, follow_redirects=True, verify=False)
         try:
             target_url = await find_working_stream(client)
-            req = client.build_request("GET", target_url, headers={"User-Agent": "Mozilla/5.0"})
+            req = client.build_request("GET", target_url, headers=HEADERS)
             resp = await client.send(req, stream=True)
             try:
                 async for chunk in resp.aiter_bytes(chunk_size=4096):
