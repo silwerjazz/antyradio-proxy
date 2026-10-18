@@ -14,8 +14,8 @@ STREAM_URLS = [
 ]
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept": "*/*",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept": "application/json",
 }
 
 ANTYRADIO_LOGO = "https://gfx.antyradio.pl/design/antyradio/images/logo.png"
@@ -25,17 +25,14 @@ last_updated = "Nigdy"
 active_stream_url = STREAM_URLS[0]
 
 
-def clean_artist_title(raw_text: str) -> str:
-    cleaned = re.sub(r"\s*\([^)]*\)", "", raw_text).strip()
-    if " - " in cleaned:
-        artist, title = cleaned.split(" - ", 1)
-        artist, title = artist.strip(), title.strip()
-        if artist.isupper() and len(artist) > 3:
-            artist = artist.title()
-        if title.isupper() and len(title) > 3:
-            title = title.title()
-        return f"{artist} - {title}"
-    return cleaned
+def clean_artist_title(artist: str, title: str) -> str:
+    artist = re.sub(r"\s*\([^)]*\)", "", artist).strip()
+    title = re.sub(r"\s*\([^)]*\)", "", title).strip()
+    if artist.isupper() and len(artist) > 3:
+        artist = artist.title()
+    if title.isupper() and len(title) > 3:
+        title = title.title()
+    return f"{artist} - {title}"
 
 
 async def fetch_rds_data():
@@ -43,28 +40,30 @@ async def fetch_rds_data():
     ts = int(time.time())
 
     async with httpx.AsyncClient(timeout=5.0, follow_redirects=True, verify=False) as client:
-        # Oficjalne otwarte API OnlineRadioBox dla Antyradia
-        try:
-            resp = await client.get(f"https://scraper2.onlineradiobox.com/pl.antyradio94?l=0&_t={ts}", headers=HEADERS)
-            if resp.status_code == 200:
-                data = resp.json()
-                title = data.get("title", "").strip()
-                if title and "antyradio" not in title.lower():
-                    current_song = clean_artist_title(title)
-                    last_updated = f"ORB API ({time.strftime('%H:%M:%S')})"
-                    return
-        except Exception:
-            pass
-
-        # Zapasowe publiczne API radio
+        # Korzystamy z publicznego punktu historii utworów radiowych
         try:
             resp = await client.get(f"https://api.allradios.pl/nowplaying/antyradio?_t={ts}", headers=HEADERS)
             if resp.status_code == 200:
                 data = resp.json()
                 track = data.get("track", "").strip()
                 if track and " - " in track:
-                    current_song = clean_artist_title(track.split(" - ", 1)[0], track.split(" - ", 1)[1])
-                    last_updated = f"AllRadios ({time.strftime('%H:%M:%S')})"
+                    parts = track.split(" - ", 1)
+                    current_song = clean_artist_title(parts[0], parts[1])
+                    last_updated = f"AllRadios API ({time.strftime('%H:%M:%S')})"
+                    return
+        except Exception:
+            pass
+
+        # Awaryjne zapytanie do Widgetu Eurozetu
+        try:
+            resp = await client.get(f"https://player.antyradio.pl/api/v1/now-playing?_t={ts}", headers=HEADERS)
+            if resp.status_code == 200:
+                data = resp.json()
+                artist = data.get("artist", "").strip()
+                title = data.get("title", "").strip()
+                if artist and title:
+                    current_song = clean_artist_title(artist, title)
+                    last_updated = f"Antyradio Player ({time.strftime('%H:%M:%S')})"
                     return
         except Exception:
             pass
