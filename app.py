@@ -18,7 +18,6 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept": "*/*",
     "Cache-Control": "no-cache, no-store",
-    "Pragma": "no-cache",
 }
 
 ANTYRADIO_LOGO = "https://gfx.antyradio.pl/design/antyradio/images/logo.png"
@@ -29,13 +28,10 @@ active_stream_url = STREAM_URLS[0]
 
 
 def clean_artist_title(raw_track: str) -> str:
-    """Formatuje wykonawcę i tytuł tak, aby Replaio pobierało okładki płyt."""
-    # Usuń dopiski typu (AC), (Radio Edit) itp.
     cleaned = re.sub(r"\s*\([^)]*\)", "", raw_track).strip()
     if " - " in cleaned:
         artist, title = cleaned.split(" - ", 1)
         artist, title = artist.strip(), title.strip()
-        # Zamień CAPS LOCK (np. METALLICA) na Metallica
         if artist.isupper() and len(artist) > 3:
             artist = artist.title()
         if title.isupper() and len(title) > 3:
@@ -44,60 +40,55 @@ def clean_artist_title(raw_track: str) -> str:
     return cleaned
 
 
-async def fetch_rds_data(client: httpx.AsyncClient):
+async def fetch_rds_data():
     global current_song, last_updated
     ts = int(time.time())
-
-    # Źródło 1: Bezpośrednie API Live JSON z OnlineRadioBox (odświeżane w czasie rzeczywistym)
-    try:
-        resp = await client.get(
-            f"https://scraper2.onlineradiobox.com/pl.antyradio94?l=0&_t={ts}",
-            headers=HEADERS,
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            title = data.get("title", "").strip()
-            if title and "antyradio" not in title.lower():
-                current_song = clean_artist_title(title)
-                last_updated = f"API ORB ({time.strftime('%H:%M:%S')})"
-                return
-    except Exception:
-        pass
-
-    # Źródło 2 (Fallback): Parsowanie tabeli na żywo z ominięciem cache
-    try:
-        resp = await client.get(
-            f"https://onlineradiobox.com/pl/antyradio94/playlist/?_t={ts}",
-            headers=HEADERS,
-        )
-        if resp.status_code == 200:
-            soup = BeautifulSoup(resp.text, "html.parser")
-            first_row = soup.select_one("table.tablelist-schedule tr td.track_history_item")
-            if first_row:
-                track = first_row.get_text(strip=True)
-                if track and "antyradio" not in track.lower():
-                    current_song = clean_artist_title(track)
-                    last_updated = f"HTML ORB ({time.strftime('%H:%M:%S')})"
+    
+    # Krótki timeout (max 5 sekund), żeby pętla nigdy się nie zawiesiła
+    async with httpx.AsyncClient(timeout=5.0, follow_redirects=True, verify=False) as client:
+        # Źródło 1: API Live JSON OnlineRadioBox
+        try:
+            resp = await client.get(
+                f"https://scraper2.onlineradiobox.com/pl.antyradio94?l=0&_t={ts}",
+                headers=HEADERS,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                title = data.get("title", "").strip()
+                if title and "antyradio" not in title.lower():
+                    current_song = clean_artist_title(title)
+                    last_updated = f"API ORB ({time.strftime('%H:%M:%S')})"
                     return
-    except Exception:
-        pass
+        except Exception:
+            pass
 
-    # Źródło 3 (Fallback 2): Małopolskie-Media Playlista Antyradia
-    try:
-        resp = await client.get(
-            f"https://malopolskie-media.info/playlista/ogolnopolskie/antyradio.html?_t={ts}",
-            headers=HEADERS,
-        )
-        if resp.status_code == 200:
-            soup = BeautifulSoup(resp.text, "html.parser")
-            first_track = soup.select_one(".utwor, .playlist-item, tr td a")
-            if first_track:
-                track = first_track.get_text(strip=True)
-                if track and " - " in track:
-                    current_song = clean_artist_title(track)
-                    last_updated = f"MM ({time.strftime('%H:%M:%S')})"
-    except Exception:
-        pass
+        # Źródło 2: HTML OnlineRadioBox
+        try:
+            resp = await client.get(
+                f"https://onlineradiobox.com/pl/antyradio94/playlist/?_t={ts}",
+                headers=HEADERS,
+            )
+            if resp.status_code == 200:
+                soup = BeautifulSoup(resp.text, "html.parser")
+                first_row = soup.select_one("table.tablelist-schedule tr td.track_history_item")
+                if first_row:
+                    track = first_row.get_text(strip=True)
+                    if track and "antyradio" not in track.lower():
+                        current_song = clean_artist_title(track)
+                        last_updated = f"HTML ORB ({time.strftime('%H:%M:%S')})"
+                        return
+        except Exception:
+            pass
+
+
+async def update_metadata_loop():
+    """Niezależna, bezpieczna pętla odświeżająca RDS co 15 sekund."""
+    while True:
+        try:
+            await fetch_rds_data()
+        except Exception:
+            pass
+        await asyncio.sleep(15)
 
 
 async def find_working_stream(client: httpx.AsyncClient) -> str:
@@ -114,17 +105,19 @@ async def find_working_stream(client: httpx.AsyncClient) -> str:
     return STREAM_URLS[0]
 
 
-async def update_metadata_loop():
-    async with httpx.AsyncClient(timeout=10.0, follow_redirects=True, verify=False) as client:
-        await find_working_stream(client)
-        while True:
-            await fetch_rds_data(client)
-            await asyncio.sleep(15)
-
-
 @app.on_event("startup")
 async def startup_event():
-    asyncio.create_task(update_metadata_loop())
+    # Od razu pobierz tytuł przy starcie i odpal pętlam w tle
+    async def initial_fetch():
+        try:
+            async with httpx.AsyncClient(timeout=5.0, verify=False) as client:
+                await find_working_stream(client)
+        except Exception:
+            pass
+        await fetch_rds_data()
+        asyncio.create_task(update_metadata_loop())
+
+    asyncio.create_task(initial_fetch())
 
 
 def build_icy_metadata(title: str) -> bytes:
