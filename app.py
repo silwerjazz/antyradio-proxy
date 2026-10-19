@@ -26,6 +26,7 @@ HEADERS = {
 }
 
 ANTYRADIO_LOGO = "https://gfx.antyradio.pl/design/antyradio/images/logo.png"
+STATION_URL = "https://www.antyradio.pl"
 META_INTERVAL = 16000
 POLL_SECONDS = 10
 # Jeśli serwer stoi za reverse proxy / w innej sieci niż odtwarzacz,
@@ -41,6 +42,8 @@ state = {
     "cover_bytes": None,
     "cover_type": "image/jpeg",
     "cover_version": 0,
+    "logo_bytes": None,
+    "logo_type": "image/png",
     "last_updated": "Nigdy",
     "stream": STREAM_URLS[0],
 }
@@ -79,13 +82,6 @@ async def fetch_rds() -> dict | None:
     return data.get("now")
 
 
-async def find_cover_url(artist: str, rds_img: str | None) -> str:
-    # 1) okładka od Eurozetu, jeśli to nie ogólny placeholder
-    if rds_img and "eurozet.jpg" not in rds_img:
-        return rds_img
-    return ""  # iTunes wywołane osobno (potrzebuje tytułu)
-
-
 async def itunes_cover(artist: str, title: str) -> str:
     try:
         r = await http.get(
@@ -111,20 +107,22 @@ async def download_cover(url: str) -> tuple[bytes, str] | None:
         ct = r.headers.get("content-type", "image/jpeg").split(";")[0]
         if r.status_code == 200 and ct.startswith("image/") and r.content:
             return r.content, ct
-        log.warning("Okładka %s: HTTP %s, %s", url, r.status_code, ct)
+        log.warning("Obrazek %s: HTTP %s, %s", url, r.status_code, ct)
     except Exception as e:
-        log.warning("Pobieranie okładki błąd: %r", e)
+        log.warning("Pobieranie obrazka błąd: %r", e)
     return None
 
 
 async def update_cover(artist: str, title: str, rds_img: str | None):
     candidates = []
-    eu = await find_cover_url(artist, rds_img)
-    if eu:
-        candidates.append(eu)
+    # 1) okładka od Eurozetu, jeśli to nie ogólny placeholder
+    if rds_img and "eurozet.jpg" not in rds_img:
+        candidates.append(rds_img)
+    # 2) iTunes
     it = await itunes_cover(artist, title)
     if it:
         candidates.append(it)
+    # 3) logo stacji
     candidates.append(ANTYRADIO_LOGO)
 
     for url in candidates:
@@ -169,6 +167,12 @@ async def update_metadata_loop():
 async def lifespan(app: FastAPI):
     global http
     http = httpx.AsyncClient(timeout=8.0, follow_redirects=True)
+    got = await download_cover(ANTYRADIO_LOGO)
+    if got:
+        state["logo_bytes"], state["logo_type"] = got
+        log.info("Logo stacji pobrane (%s B)", len(got[0]))
+    else:
+        log.warning("Nie udało się pobrać logo stacji")
     task = asyncio.create_task(update_metadata_loop())
     yield
     task.cancel()
@@ -178,9 +182,12 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 
+def base_url(request: Request) -> str:
+    return PUBLIC_URL or str(request.base_url).rstrip("/")
+
+
 def cover_url(request: Request) -> str:
-    base = PUBLIC_URL or str(request.base_url).rstrip("/")
-    return f"{base}/cover.jpg?v={state['cover_version']}"
+    return f"{base_url(request)}/cover.jpg?v={state['cover_version']}"
 
 
 def build_icy_metadata(title: str, url: str) -> bytes:
@@ -220,6 +227,7 @@ def health_check():
         "cover_version": state["cover_version"],
         "last_updated": state["last_updated"],
         "stream": state["stream"],
+        "logo_loaded": state["logo_bytes"] is not None,
     }
 
 
@@ -234,12 +242,24 @@ async def cover():
     return RedirectResponse(state["cover"], status_code=302)
 
 
-def icy_headers(icy_requested: bool) -> dict:
+@app.get("/logo.png")
+async def logo():
+    if state["logo_bytes"]:
+        return Response(
+            content=state["logo_bytes"],
+            media_type=state["logo_type"],
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
+    return RedirectResponse(ANTYRADIO_LOGO, status_code=302)
+
+
+def icy_headers(request: Request, icy_requested: bool) -> dict:
     h = {
         "Content-Type": "audio/mpeg",
         "icy-name": "Antyradio",
         "icy-genre": "Rock",
-        "icy-logo": ANTYRADIO_LOGO,
+        "icy-url": STATION_URL,
+        "icy-logo": f"{base_url(request)}/logo.png",
         "icy-br": "128",
         "Accept-Ranges": "none",
         "Cache-Control": "no-cache, no-store, must-revalidate",
@@ -252,7 +272,7 @@ def icy_headers(icy_requested: bool) -> dict:
 @app.head("/antyradio.mp3")
 async def head_audio(request: Request):
     icy = request.headers.get("icy-metadata", "0").strip() == "1"
-    return Response(status_code=200, headers=icy_headers(icy))
+    return Response(status_code=200, headers=icy_headers(request, icy))
 
 
 @app.get("/antyradio.mp3")
@@ -293,4 +313,8 @@ async def stream_audio(request: Request):
                 await resp.aclose()
             await client.aclose()
 
-    return StreamingResponse(audio_generator(), media_type="audio/mpeg", headers=icy_headers(icy_requested))
+    return StreamingResponse(
+        audio_generator(),
+        media_type="audio/mpeg",
+        headers=icy_headers(request, icy_requested),
+    )
